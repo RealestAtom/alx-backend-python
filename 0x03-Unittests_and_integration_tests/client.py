@@ -3,7 +3,7 @@
 GithubOrgClient module
 """
 
-from utils import get_json
+import utils
 
 
 class GithubOrgClient:
@@ -15,4 +15,4 @@ class GithubOrgClient:
     @property
     def org(self):
         """Return JSON payload of organization from GitHub API"""
-        return get_json(f"https://api.github.com/orgs/{self.org_name}")
+        return utils.get_json(f"https://api.github.com/orgs/{self.org_name}")
