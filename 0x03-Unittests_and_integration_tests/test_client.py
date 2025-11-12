@@ -23,7 +23,6 @@ class TestGithubOrgClient(unittest.TestCase):
         mock_get_json.return_value = {"login": org_name}
         client = GithubOrgClient(org_name)
         result = client.org
-
         mock_get_json.assert_called_once_with(
             f"https://api.github.com/orgs/{org_name}"
         )
@@ -33,7 +32,6 @@ class TestGithubOrgClient(unittest.TestCase):
         """Test _public_repos_url property"""
         client = GithubOrgClient("test_org")
         payload = {"repos_url": "https://api.github.com/orgs/test_org/repos"}
-
         with patch.object(
             GithubOrgClient, "org", new_callable=property
         ) as mock_org:
@@ -47,7 +45,6 @@ class TestGithubOrgClient(unittest.TestCase):
         client = GithubOrgClient("test_org")
         payload = [{"name": "repo1"}, {"name": "repo2"}]
         mock_get_json.return_value = payload
-
         with patch.object(
             GithubOrgClient, "_public_repos_url", new_callable=property
         ) as mock_url:
@@ -87,8 +84,8 @@ class TestIntegrationGithubOrgClient(unittest.TestCase):
         cls.get_patcher = patch("client.utils.requests.get")
         cls.mock_get = cls.get_patcher.start()
 
-        # Side effect function for requests.get().json()
         def get_side_effect(url, *args, **kwargs):
+            """Return mocked response for requests.get().json()"""
             mock_resp = Mock()
             if url.endswith("/repos"):
                 mock_resp.json.return_value = cls.repos_payload
