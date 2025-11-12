@@ -1,23 +1,5 @@
 #!/usr/bin/env python3
 """
-GithubOrgClient module
-"""
-
-import utils
-
-
-class GithubOrgClient:
-    """Github organization client"""
-
-    def __init__(self, org_name):
-        self.org_name = org_name
-
-    @property
-    def org(self):
-        """Return JSON payload of organization from GitHub API"""
-        return utils.get_json(f"https://api.github.com/orgs/{self.org_name}")
-#!/usr/bin/env python3
-"""
 Unittests for client.GithubOrgClient
 """
 
@@ -34,7 +16,9 @@ class TestGithubOrgClient(unittest.TestCase):
         ("google",),
         ("abc",),
     ])
-    @patch("client.utils.get_json")  # patch where client.py actually calls get_json
+    @patch(
+        "client.utils.get_json"
+    )  # patch where client.py actually calls get_json
     def test_org(self, org_name, mock_get_json):
         """Test that GithubOrgClient.org returns expected value"""
         # Mock the return value
@@ -46,7 +30,7 @@ class TestGithubOrgClient(unittest.TestCase):
         # Access org property (do not call as method)
         result = client.org
 
-        # Assert get_json called exactly once with the correct URL
+        # Assert get_json called exactly once with correct URL
         mock_get_json.assert_called_once_with(
             f"https://api.github.com/orgs/{org_name}"
         )
