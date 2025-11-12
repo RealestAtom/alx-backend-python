@@ -46,11 +46,15 @@ class TestGithubOrgClient(unittest.TestCase):
         with patch.object(
             GithubOrgClient, "_public_repos_url", new_callable=property
         ) as mock_url:
-            mock_url.return_value = "https://api.github.com/orgs/test_org/repos"
+            mock_url.return_value = (
+                "https://api.github.com/orgs/test_org/repos"
+            )
             result = client.public_repos()
             self.assertEqual(result, ["repo1", "repo2"])
             self.assertTrue(mock_url.called)
-            mock_get_json.assert_called_once_with(mock_url.return_value)
+            mock_get_json.assert_called_once_with(
+                mock_url.return_value
+            )
 
     def test_has_license(self):
         """Test has_license method"""
