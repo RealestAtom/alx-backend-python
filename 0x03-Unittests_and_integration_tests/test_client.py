@@ -23,6 +23,7 @@ class TestGithubOrgClient(unittest.TestCase):
         mock_get_json.return_value = {"login": org_name}
         client = GithubOrgClient(org_name)
         result = client.org
+
         mock_get_json.assert_called_once_with(
             f"https://api.github.com/orgs/{org_name}"
         )
@@ -80,12 +81,12 @@ class TestIntegrationGithubOrgClient(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Set up the class-level patcher for requests.get"""
+        """Set up class-level patcher for requests.get"""
         cls.get_patcher = patch("client.utils.requests.get")
         cls.mock_get = cls.get_patcher.start()
 
+        # Side effect returns org or repos payload depending on URL
         def get_side_effect(url, *args, **kwargs):
-            """Return mocked response for requests.get().json()"""
             mock_resp = Mock()
             if url.endswith("/repos"):
                 mock_resp.json.return_value = cls.repos_payload
@@ -103,17 +104,17 @@ class TestIntegrationGithubOrgClient(unittest.TestCase):
     def test_public_repos(self):
         """Integration test for public_repos method"""
         client = GithubOrgClient(self.org_payload["login"])
-        repos = client.public_repos()
-        self.assertEqual(repos, self.expected_repos)
+        result = client.public_repos()
+        self.assertEqual(result, self.expected_repos)
 
     def test_public_repos_with_license(self):
-        """Integration test for public_repos filtered by license"""
+        """Integration test for public_repos filtered by license='apache-2.0'"""
         client = GithubOrgClient(self.org_payload["login"])
-        apache2_repos_result = [
+        result = [
             repo["name"] for repo in client.public_repos()
             if client.has_license(repo, "apache-2.0")
         ]
-        self.assertEqual(apache2_repos_result, self.apache2_repos)
+        self.assertEqual(result, self.apache2_repos)
 
 
 if __name__ == "__main__":
