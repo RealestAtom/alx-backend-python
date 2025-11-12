@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+Unittests for utils.py
+Covers: access_nested_map, get_json, and memoize
+"""
+
 import unittest
 from unittest.mock import patch, Mock
 from parameterized import parameterized
@@ -38,12 +43,15 @@ class TestGetJson(unittest.TestCase):
     @patch("utils.requests.get")
     def test_get_json(self, test_url, test_payload, mock_get):
         """Test that utils.get_json returns expected result"""
+        # Mock response
         mock_response = Mock()
         mock_response.json.return_value = test_payload
         mock_get.return_value = mock_response
 
+        # Call the function
         result = get_json(test_url)
 
+        # Assertions
         mock_get.assert_called_once_with(test_url)
         self.assertEqual(result, test_payload)
 
@@ -53,7 +61,10 @@ class TestMemoize(unittest.TestCase):
 
     def test_memoize(self):
         """Test that memoize caches method results"""
+
         class TestClass:
+            """A simple test class"""
+
             def a_method(self):
                 return 42
 
@@ -61,11 +72,19 @@ class TestMemoize(unittest.TestCase):
             def a_property(self):
                 return self.a_method()
 
+        # Patch a_method to track calls
         with patch.object(TestClass, "a_method", return_value=42) as mock_method:
             obj = TestClass()
-            first_call = obj.a_property()
-            second_call = obj.a_property()
 
+            # Access twice (property, not method!)
+            first_call = obj.a_property
+            second_call = obj.a_property
+
+            # Assertions
             self.assertEqual(first_call, 42)
             self.assertEqual(second_call, 42)
             mock_method.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()
