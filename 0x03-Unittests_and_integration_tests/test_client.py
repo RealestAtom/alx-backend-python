@@ -4,7 +4,7 @@ Unittests for client.GithubOrgClient
 """
 
 import unittest
-from unittest.mock import patch, Mock
+from unittest.mock import patch
 from parameterized import parameterized
 from client import GithubOrgClient
 
@@ -16,9 +16,7 @@ class TestGithubOrgClient(unittest.TestCase):
         ("google",),
         ("abc",),
     ])
-    @patch(
-        "client.utils.get_json"
-    )  # patch where client.py actually calls get_json
+    @patch("client.get_json")  # patch where it's imported in client.py
     def test_org(self, org_name, mock_get_json):
         """Test that GithubOrgClient.org returns expected value"""
         # Mock the return value
