@@ -16,24 +16,17 @@ class TestGithubOrgClient(unittest.TestCase):
         ("google",),
         ("abc",),
     ])
-    @patch("client.get_json")  # patch where it's imported in client.py
+    @patch("client.utils.get_json")  # must match 'import utils' in client.py
     def test_org(self, org_name, mock_get_json):
         """Test that GithubOrgClient.org returns expected value"""
-        # Mock the return value
         mock_get_json.return_value = {"login": org_name}
-
-        # Instantiate client
         client = GithubOrgClient(org_name)
-
-        # Access org property (do not call as method)
         result = client.org
 
-        # Assert get_json called exactly once with correct URL
+        # Assert get_json called once with the correct URL
         mock_get_json.assert_called_once_with(
             f"https://api.github.com/orgs/{org_name}"
         )
-
-        # Assert the property returns the mocked value
         self.assertEqual(result, {"login": org_name})
 
 
