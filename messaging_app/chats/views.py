@@ -1,8 +1,6 @@
-
 from rest_framework import viewsets, status, filters
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
-
 from .models import Conversation, Message
 from .serializers import ConversationSerializer, MessageSerializer
 
@@ -19,6 +17,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         if not participants or len(participants) < 2:
             raise ValidationError("A conversation must include at least two participants.")
 
+        # Create the conversation
         conversation = Conversation.objects.create()
         conversation.participants.set(participants)
         conversation.save()
@@ -38,20 +37,20 @@ class MessageViewSet(viewsets.ModelViewSet):
         sender = request.data.get("sender")
         message_body = request.data.get("message_body")
 
+        # Validate input
         if not conversation_id:
-            raise ValidationError("conversation is required.")
-
+            raise ValidationError({"conversation": "This field is required."})
         if not sender:
-            raise ValidationError("sender is required.")
-
+            raise ValidationError({"sender": "This field is required."})
         if not message_body:
-            raise ValidationError("message_body cannot be empty.")
+            raise ValidationError({"message_body": "This field cannot be empty."})
 
         try:
-            conversation = Conversation.objects.get(conversation_id=conversation_id)
+            conversation = Conversation.objects.get(id=conversation_id)
         except Conversation.DoesNotExist:
-            raise ValidationError("Conversation does not exist.")
+            raise ValidationError({"conversation": "Conversation does not exist."})
 
+        # Create the message
         message = Message.objects.create(
             conversation=conversation,
             sender_id=sender,
