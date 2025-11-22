@@ -1,1 +1,1 @@
-
+"""Models for authentication"""
