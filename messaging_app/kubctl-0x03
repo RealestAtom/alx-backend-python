@@ -1,0 +1,556 @@
+
+#!/bin/bash
+
+# kubctl-0x03 - Rolling Update Script
+# Objective: Apply rolling update, monitor progress, test for zero downtime
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Configuration
+DEPLOYMENT_NAME="django-app-blue"
+SERVICE_NAME="django-app-service"
+NAMESPACE="default"
+NEW_IMAGE_VERSION="v2.0.0"
+OLD_IMAGE_VERSION="v1.0.0"
+DEPLOYMENT_FILE="blue_deployment.yaml"
+TEST_DURATION=60  # seconds for continuous testing
+TEST_INTERVAL=1   # seconds between requests
+REQUEST_TIMEOUT=5 # seconds for curl timeout
+
+# Logging functions
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step() { echo -e "${PURPLE}[STEP]${NC} $1"; }
+log_monitor() { echo -e "${CYAN}[MONITOR]${NC} $1"; }
+
+# Check prerequisites
+check_prerequisites() {
+    log_step "1. Checking prerequisites..."
+    
+    # Check kubectl
+    if ! command -v kubectl &> /dev/null; then
+        log_error "kubectl is not installed"
+        exit 1
+    fi
+    
+    # Check cluster connectivity
+    if ! kubectl cluster-info &> /dev/null; then
+        log_error "Cannot connect to Kubernetes cluster"
+        exit 1
+    fi
+    
+    # Check if deployment exists
+    if ! kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" &> /dev/null; then
+        log_error "Deployment '$DEPLOYMENT_NAME' not found"
+        log_info "Please deploy the app first: kubectl apply -f blue_deployment.yaml"
+        exit 1
+    fi
+    
+    # Check if curl is available
+    if ! command -v curl &> /dev/null; then
+        log_error "curl is not installed"
+        exit 1
+    fi
+    
+    # Check deployment file exists
+    if [[ ! -f "$DEPLOYMENT_FILE" ]]; then
+        log_error "Deployment file '$DEPLOYMENT_FILE' not found"
+        exit 1
+    fi
+    
+    log_success "All prerequisites satisfied"
+}
+
+# Get current deployment status
+get_current_status() {
+    log_step "2. Getting current deployment status..."
+    
+    log_info "Current deployment details:"
+    kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o wide
+    
+    # Get current image version
+    CURRENT_IMAGE=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.spec.template.spec.containers[0].image}')
+    
+    # Get current replicas
+    CURRENT_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.spec.replicas}')
+    READY_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.status.readyReplicas}')
+    AVAILABLE_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.status.availableReplicas}')
+    
+    log_info "Current image: $CURRENT_IMAGE"
+    log_info "Current replicas: $CURRENT_REPLICAS"
+    log_info "Ready replicas: $READY_REPLICAS"
+    log_info "Available replicas: $AVAILABLE_REPLICAS"
+    
+    # Get pod details
+    log_info "Current pods:"
+    kubectl get pods -n "$NAMESPACE" -l app=django-messaging -o custom-columns="NAME:.metadata.name,STATUS:.status.phase,IP:.status.podIP,NODE:.spec.nodeName,AGE:.metadata.creationTimestamp" --sort-by=.metadata.creationTimestamp
+    
+    # Get service details
+    log_info "Service details:"
+    kubectl get service "$SERVICE_NAME" -n "$NAMESPACE" -o wide
+    
+    # Store initial state
+    INITIAL_PODS=$(kubectl get pods -n "$NAMESPACE" -l app=django-messaging --no-headers | wc -l | tr -d ' ')
+    INITIAL_READY=$(kubectl get pods -n "$NAMESPACE" -l app=django-messaging --no-headers | grep -c "Running")
+    
+    log_monitor "Initial state: $INITIAL_PODS pods total, $INITIAL_READY ready"
+}
+
+# Setup port-forwarding for testing
+setup_port_forward() {
+    log_step "3. Setting up port-forwarding for continuous testing..."
+    
+    # Kill any existing port-forward
+    pkill -f "kubectl port-forward" 2>/dev/null || true
+    sleep 2
+    
+    # Start port-forward in background
+    log_info "Starting port-forward to service $SERVICE_NAME..."
+    kubectl port-forward "service/$SERVICE_NAME" -n "$NAMESPACE" 8000:8000 > /tmp/k8s-rolling-update-portforward.log 2>&1 &
+    PORT_FORWARD_PID=$!
+    
+    # Wait for port-forward to establish
+    sleep 5
+    
+    # Check if port-forward is working
+    if ! ss -tln | grep -q ":8000"; then
+        log_error "Port-forward failed to establish"
+        cat /tmp/k8s-rolling-update-portforward.log
+        kill $PORT_FORWARD_PID 2>/dev/null
+        return 1
+    fi
+    
+    # Test the connection
+    if curl -s --max-time 5 http://localhost:8000/health/ > /dev/null 2>&1; then
+        log_success "Port-forward established (PID: $PORT_FORWARD_PID)"
+        echo $PORT_FORWARD_PID > /tmp/port_forward_pid
+        return 0
+    else
+        log_error "Service not accessible via port-forward"
+        kill $PORT_FORWARD_PID 2>/dev/null
+        return 1
+    fi
+}
+
+# Start continuous testing
+start_continuous_testing() {
+    log_step "4. Starting continuous testing during rolling update..."
+    
+    local test_pid_file="/tmp/continuous_test_pid"
+    
+    # Create test script
+    cat > /tmp/continuous_test.sh << 'EOF'
+#!/bin/bash
+TEST_URL="http://localhost:8000"
+TEST_DURATION=60
+INTERVAL=1
+TIMEOUT=5
+SUCCESS_COUNT=0
+FAILURE_COUNT=0
+START_TIME=$(date +%s)
+
+echo "Starting continuous testing..."
+echo "URL: $TEST_URL"
+echo "Duration: ${TEST_DURATION}s"
+echo "Interval: ${INTERVAL}s"
+echo ""
+
+while true; do
+    CURRENT_TIME=$(date +%s)
+    ELAPSED=$((CURRENT_TIME - START_TIME))
+    
+    if [[ $ELAPSED -ge $TEST_DURATION ]]; then
+        break
+    fi
+    
+    # Send request with timestamp
+    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+    RESPONSE_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time $TIMEOUT "$TEST_URL/health/" 2>/dev/null)
+    
+    if [[ "$RESPONSE_CODE" =~ ^[23] ]]; then
+        echo "[$TIMESTAMP] ✓ Success: HTTP $RESPONSE_CODE"
+        ((SUCCESS_COUNT++))
+    else
+        echo "[$TIMESTAMP] ✗ Failure: HTTP $RESPONSE_CODE"
+        ((FAILURE_COUNT++))
+    fi
+    
+    sleep $INTERVAL
+done
+
+echo ""
+echo "Test Summary:"
+echo "Total requests: $((SUCCESS_COUNT + FAILURE_COUNT))"
+echo "Success: $SUCCESS_COUNT"
+echo "Failure: $FAILURE_COUNT"
+echo "Success rate: $(awk "BEGIN {printf \"%.2f%%\", $SUCCESS_COUNT/($SUCCESS_COUNT+$FAILURE_COUNT)*100}")"
+EOF
+    
+    chmod +x /tmp/continuous_test.sh
+    
+    # Run test in background
+    /tmp/continuous_test.sh > /tmp/continuous_test_results.log 2>&1 &
+    TEST_PID=$!
+    
+    echo $TEST_PID > $test_pid_file
+    log_success "Continuous testing started (PID: $TEST_PID)"
+    log_info "Results are being logged to: /tmp/continuous_test_results.log"
+    
+    # Show first few test results
+    sleep 3
+    echo ""
+    log_info "First few test results:"
+    head -5 /tmp/continuous_test_results.log
+    
+    return $TEST_PID
+}
+
+# Apply rolling update
+apply_rolling_update() {
+    log_step "5. Applying rolling update to version $NEW_IMAGE_VERSION..."
+    
+    # Verify deployment file has the new version
+    if ! grep -q "$NEW_IMAGE_VERSION" "$DEPLOYMENT_FILE" 2>/dev/null; then
+        log_warning "New version $NEW_IMAGE_VERSION not found in $DEPLOYMENT_FILE"
+        log_info "Checking current image in deployment file..."
+        grep -i "image:" "$DEPLOYMENT_FILE" || true
+    fi
+    
+    # Apply the updated deployment
+    log_info "Applying updated deployment configuration..."
+    kubectl apply -f "$DEPLOYMENT_FILE"
+    
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to apply deployment update"
+        return 1
+    fi
+    
+    log_success "Deployment update triggered"
+    
+    # Show what changed
+    log_info "Deployment changes:"
+    kubectl describe deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" | grep -A 5 "Image:" || true
+}
+
+# Monitor rolling update progress
+monitor_rollout() {
+    log_step "6. Monitoring rolling update progress..."
+    
+    log_info "Starting rollout status monitoring..."
+    
+    # Monitor rollout status in background
+    (
+        kubectl rollout status deployment/"$DEPLOYMENT_NAME" -n "$NAMESPACE" --timeout=300s --watch=true 2>&1 | \
+        while read -r line; do
+            echo -e "${CYAN}[ROLLOUT]${NC} $line"
+        done
+    ) &
+    ROLLOUT_MONITOR_PID=$!
+    
+    # Monitor pod changes
+    log_info "Monitoring pod changes during rollout..."
+    
+    echo -e "\n${YELLOW}Pod Status During Rollout:${NC}"
+    echo -e "Time                  Pod Name                 Status     Ready     Node              Version"
+    echo -e "--------------------------------------------------------------------------------------------"
+    
+    START_TIME=$(date +%s)
+    
+    for i in {1..30}; do  # Monitor for up to 5 minutes
+        # Get pod information
+        PODS_INFO=$(kubectl get pods -n "$NAMESPACE" -l app=django-messaging \
+            -o custom-columns="NAME:.metadata.name,STATUS:.status.phase,READY:.status.containerStatuses[0].ready,NODE:.spec.nodeName" \
+            --no-headers 2>/dev/null || true)
+        
+        # Get pod images
+        for pod in $(kubectl get pods -n "$NAMESPACE" -l app=django-messaging -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            POD_IMAGE=$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+            # Extract version from image
+            if [[ "$POD_IMAGE" == *":"* ]]; then
+                VERSION="${POD_IMAGE##*:}"
+            else
+                VERSION="latest"
+            fi
+            
+            # Find this pod in PODS_INFO and add version
+            POD_LINE=$(echo "$PODS_INFO" | grep "^$pod\s")
+            if [[ -n "$POD_LINE" ]]; then
+                TIMESTAMP=$(date '+%H:%M:%S')
+                echo -e "$TIMESTAMP   $POD_LINE   $VERSION"
+            fi
+        done
+        
+        # Check if rollout is complete
+        if ! ps -p $ROLLOUT_MONITOR_PID > /dev/null 2>&1; then
+            log_info "Rollout monitoring completed"
+            break
+        fi
+        
+        sleep 10
+        
+        # Break if we've been monitoring for too long
+        CURRENT_TIME=$(date +%s)
+        if [[ $((CURRENT_TIME - START_TIME)) -gt 300 ]]; then
+            log_warning "Rollout monitoring timeout after 5 minutes"
+            break
+        fi
+    done
+    
+    # Wait for rollout monitor to finish
+    wait $ROLLOUT_MONITOR_PID 2>/dev/null
+    ROLLOUT_EXIT_CODE=$?
+    
+    if [[ $ROLLOUT_EXIT_CODE -eq 0 ]]; then
+        log_success "Rollout completed successfully"
+    else
+        log_error "Rollout failed or timed out"
+        return 1
+    fi
+}
+
+# Check for downtime/disruption
+check_for_downtime() {
+    log_step "7. Checking for downtime or disruption..."
+    
+    # Wait for continuous testing to complete
+    TEST_PID=$(cat /tmp/continuous_test_pid 2>/dev/null || echo "")
+    
+    if [[ -n "$TEST_PID" ]] && ps -p "$TEST_PID" > /dev/null 2>&1; then
+        log_info "Waiting for continuous testing to complete..."
+        wait "$TEST_PID" 2>/dev/null
+    fi
+    
+    # Analyze test results
+    if [[ -f /tmp/continuous_test_results.log ]]; then
+        log_info "Analyzing test results..."
+        
+        # Get summary from test results
+        SUCCESS_COUNT=$(grep -c "✓ Success" /tmp/continuous_test_results.log 2>/dev/null || echo 0)
+        FAILURE_COUNT=$(grep -c "✗ Failure" /tmp/continuous_test_results.log 2>/dev/null || echo 0)
+        TOTAL_REQUESTS=$((SUCCESS_COUNT + FAILURE_COUNT))
+        
+        if [[ $TOTAL_REQUESTS -gt 0 ]]; then
+            SUCCESS_RATE=$(awk "BEGIN {printf \"%.2f\", $SUCCESS_COUNT/$TOTAL_REQUESTS*100}")
+            
+            log_info "Continuous Test Results:"
+            echo "  Total requests: $TOTAL_REQUESTS"
+            echo "  Successful: $SUCCESS_COUNT"
+            echo "  Failed: $FAILURE_COUNT"
+            echo "  Success rate: ${SUCCESS_RATE}%"
+            
+            if [[ $FAILURE_COUNT -eq 0 ]]; then
+                log_success "✓ Zero downtime achieved! No failed requests during rolling update."
+            elif [[ $(echo "$SUCCESS_RATE >= 99.0" | bc -l 2>/dev/null || echo 0) -eq 1 ]]; then
+                log_success "✓ Minimal disruption (${SUCCESS_RATE}% success rate)"
+            elif [[ $(echo "$SUCCESS_RATE >= 95.0" | bc -l 2>/dev/null || echo 0) -eq 1 ]]; then
+                log_warning "⚠ Minor disruption (${SUCCESS_RATE}% success rate)"
+            else
+                log_error "✗ Significant disruption detected (${SUCCESS_RATE}% success rate)"
+            fi
+            
+            # Show failure timestamps if any
+            if [[ $FAILURE_COUNT -gt 0 ]]; then
+                log_info "Failure timestamps:"
+                grep "✗ Failure" /tmp/continuous_test_results.log | head -5
+            fi
+        else
+            log_warning "No test results available"
+        fi
+    else
+        log_warning "Test results file not found"
+    fi
+}
+
+# Verify rolling update completion
+verify_update_completion() {
+    log_step "8. Verifying rolling update completion..."
+    
+    log_info "Final deployment status:"
+    kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o wide
+    
+    # Get updated image version
+    UPDATED_IMAGE=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.spec.template.spec.containers[0].image}')
+    
+    log_info "Updated image: $UPDATED_IMAGE"
+    
+    # Verify all pods are running new version
+    log_info "Verifying all pods are running version $NEW_IMAGE_VERSION..."
+    
+    ALL_NEW_VERSION=true
+    for pod in $(kubectl get pods -n "$NAMESPACE" -l app=django-messaging -o jsonpath='{.items[*].metadata.name}'); do
+        POD_IMAGE=$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.spec.containers[0].image}')
+        if [[ "$POD_IMAGE" != *"$NEW_IMAGE_VERSION"* ]] && [[ "$POD_IMAGE" != *"v2.0"* ]]; then
+            log_warning "Pod $pod is still on old version: $POD_IMAGE"
+            ALL_NEW_VERSION=false
+        fi
+    done
+    
+    if [[ "$ALL_NEW_VERSION" = true ]]; then
+        log_success "✓ All pods are running the new version"
+    else
+        log_warning "⚠ Some pods may still be on old version"
+    fi
+    
+    # Check pod status
+    log_info "Final pod status:"
+    kubectl get pods -n "$NAMESPACE" -l app=django-messaging -o custom-columns="NAME:.metadata.name,STATUS:.status.phase,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount,AGE:.metadata.creationTimestamp,IMAGE:.spec.containers[0].image" --sort-by=.metadata.creationTimestamp
+    
+    # Get replica counts
+    CURRENT_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.spec.replicas}')
+    READY_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.status.readyReplicas}')
+    AVAILABLE_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.status.availableReplicas}')
+    
+    log_info "Replica status:"
+    echo "  Desired: $CURRENT_REPLICAS"
+    echo "  Ready: $READY_REPLICAS"
+    echo "  Available: $AVAILABLE_REPLICAS"
+    
+    if [[ "$READY_REPLICAS" -eq "$CURRENT_REPLICAS" ]] && [[ "$AVAILABLE_REPLICAS" -eq "$CURRENT_REPLICAS" ]]; then
+        log_success "✓ All replicas are ready and available"
+    else
+        log_error "✗ Not all replicas are ready/available"
+    fi
+    
+    # Test the updated deployment
+    log_info "Testing updated deployment..."
+    if curl -s --max-time 10 http://localhost:8000/health/ > /dev/null 2>&1; then
+        log_success "✓ Updated deployment is responding correctly"
+        
+        # Check version in response
+        VERSION_RESPONSE=$(curl -s --max-time 5 http://localhost:8000/health/ 2>/dev/null || echo "")
+        if echo "$VERSION_RESPONSE" | grep -q -i "2.0\|v2"; then
+            log_success "✓ Confirmed: Application is running version 2.0"
+        fi
+    else
+        log_error "✗ Updated deployment is not responding"
+    fi
+}
+
+# Cleanup
+cleanup() {
+    log_step "9. Cleaning up..."
+    
+    # Stop port-forward
+    if [[ -f /tmp/port_forward_pid ]]; then
+        PORT_FORWARD_PID=$(cat /tmp/port_forward_pid)
+        kill $PORT_FORWARD_PID 2>/dev/null
+        rm -f /tmp/port_forward_pid
+        log_info "Stopped port-forward"
+    fi
+    
+    # Clean up test files
+    rm -f /tmp/continuous_test.sh /tmp/continuous_test_pid 2>/dev/null
+    
+    log_success "Cleanup completed"
+}
+
+# Display summary
+display_summary() {
+    log_step "Rolling Update Summary"
+    
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}    ROLLING UPDATE COMPLETE           ${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    
+    # Get final status
+    CURRENT_IMAGE=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+    
+    READY_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+    TOTAL_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" \
+        -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+    
+    echo -e "${BLUE}Deployment:${NC} $DEPLOYMENT_NAME"
+    echo -e "${BLUE}Image Version:${NC} $CURRENT_IMAGE"
+    echo -e "${BLUE}Replicas:${NC} $READY_REPLICAS/$TOTAL_REPLICAS ready"
+    
+    # Show test results if available
+    if [[ -f /tmp/continuous_test_results.log ]]; then
+        SUCCESS_COUNT=$(grep -c "✓ Success" /tmp/continuous_test_results.log 2>/dev/null || echo 0)
+        FAILURE_COUNT=$(grep -c "✗ Failure" /tmp/continuous_test_results.log 2>/dev/null || echo 0)
+        TOTAL=$((SUCCESS_COUNT + FAILURE_COUNT))
+        
+        if [[ $TOTAL -gt 0 ]]; then
+            RATE=$(awk "BEGIN {printf \"%.1f\", $SUCCESS_COUNT/$TOTAL*100}")
+            echo -e "${BLUE}Test Results:${NC} ${SUCCESS_COUNT}/${TOTAL} successful (${RATE}%)"
+            
+            if [[ $FAILURE_COUNT -eq 0 ]]; then
+                echo -e "${GREEN}✓ Zero downtime achieved${NC}"
+            else
+                echo -e "${YELLOW}⚠ ${FAILURE_COUNT} failed requests during update${NC}"
+            fi
+        fi
+    fi
+    
+    echo -e "\n${BLUE}Verification Commands:${NC}"
+    echo "  kubectl get deployment $DEPLOYMENT_NAME"
+    echo "  kubectl get pods -l app=django-messaging"
+    echo "  kubectl describe deployment $DEPLOYMENT_NAME"
+    echo "  kubectl rollout history deployment/$DEPLOYMENT_NAME"
+    
+    echo -e "\n${YELLOW}Rollback Commands:${NC}"
+    echo "  kubectl rollout undo deployment/$DEPLOYMENT_NAME"
+    echo "  kubectl rollout undo deployment/$DEPLOYMENT_NAME --to-revision=1"
+    
+    echo -e "\n${BLUE}Rollout History:${NC}"
+    kubectl rollout history deployment/"$DEPLOYMENT_NAME" -n "$NAMESPACE" 2>/dev/null || echo "History not available"
+}
+
+# Main execution
+main() {
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}     Kubernetes Rolling Update        ${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    
+    # Trap for cleanup on exit
+    trap cleanup EXIT INT TERM
+    
+    # Execute all steps
+    check_prerequisites
+    get_current_status
+    
+    if ! setup_port_forward; then
+        log_error "Failed to setup port-forwarding. Using direct service testing."
+        # Continue without port-forward
+    fi
+    
+    # Start continuous testing
+    start_continuous_testing
+    TEST_PID=$!
+    
+    # Apply and monitor rolling update
+    apply_rolling_update
+    monitor_rollout
+    
+    # Wait for testing to complete
+    if [[ -n "$TEST_PID" ]] && ps -p "$TEST_PID" > /dev/null 2>&1; then
+        log_info "Waiting for continuous testing to finish..."
+        wait "$TEST_PID" 2>/dev/null
+    fi
+    
+    # Check results
+    check_for_downtime
+    verify_update_completion
+    display_summary
+}
+
+# Run main function
+main "$@"
