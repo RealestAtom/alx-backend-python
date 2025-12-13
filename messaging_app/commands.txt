@@ -1,0 +1,106 @@
+
+# Kubernetes Ingress Setup Commands
+# Task 3: Set Up Kubernetes Ingress for External Access
+
+# ===========================================
+# MAIN COMMAND TO APPLY INGRESS CONFIGURATION
+# ===========================================
+kubectl apply -f ingress.yaml
+
+# ===========================================
+# COMPLETE SETUP COMMANDS
+# ===========================================
+
+# 1. Install Nginx Ingress Controller
+
+# Option A: For Minikube
+minikube addons enable ingress
+minikube addons enable ingress-dns
+
+# Option B: For generic Kubernetes
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.1/deploy/static/provider/cloud/deploy.yaml
+
+# Wait for ingress controller
+kubectl wait --namespace ingress-nginx \
+  --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller \
+  --timeout=120s
+
+# 2. Verify installation
+kubectl get pods -n ingress-nginx
+kubectl get services -n ingress-nginx
+
+# 3. Create and apply Ingress resource
+cat > ingress.yaml << 'EOF'
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: django-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+  - host: django-app.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: django-service
+            port:
+              number: 8000
+      - path: /api/
+        pathType: Prefix
+        backend:
+          service:
+            name: django-service
+            port:
+              number: 8000
+EOF
+
+# Apply the Ingress configuration
+kubectl apply -f ingress.yaml
+
+# 4. Check Ingress status
+kubectl get ingress
+kubectl describe ingress django-ingress
+
+# 5. Get Ingress IP (for Minikube)
+minikube ip
+
+# 6. Update hosts file for local development
+echo "$(minikube ip) django-app.local" | sudo tee -a /etc/hosts
+
+# 7. Test the Ingress
+curl -H "Host: django-app.local" http://django-app.local
+curl -H "Host: django-app.local" http://django-app.local/api/
+
+# 8. Monitor Ingress controller logs
+kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller -f
+
+# 9. Cleanup commands
+kubectl delete -f ingress.yaml
+kubectl delete namespace ingress-nginx
+# For Minikube:
+minikube addons disable ingress
+
+# ===========================================
+# TROUBLESHOOTING COMMANDS
+# ===========================================
+
+# Check Ingress controller events
+kubectl get events -n ingress-nginx --sort-by='.lastTimestamp'
+
+# Check Ingress controller configuration
+kubectl describe pod -n ingress-nginx -l app.kubernetes.io/component=controller
+
+# Check Nginx configuration
+kubectl exec -n ingress-nginx -it <ingress-pod-name> -- cat /etc/nginx/nginx.conf
+
+# Test backend connectivity
+kubectl run test-curl --image=curlimages/curl:8.2.1 --rm -it --restart=Never -- \
+  curl -v http://django-service:8000
+
+# Get detailed Ingress information
+kubectl get ingress django-ingress -o yaml
