@@ -1,0 +1,41 @@
+
+# kubeservice.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: django-app-service
+  annotations:
+    # Annotations for monitoring and traffic management
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+spec:
+  # Initial selector - points to blue deployment
+  selector:
+    app: django-messaging
+    version: blue
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+  type: ClusterIP
+---
+# Optional: Ingress for external access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: django-app-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+  - host: django-app.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: django-app-service
+            port:
+              number: 8000
