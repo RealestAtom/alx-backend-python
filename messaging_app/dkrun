@@ -1,0 +1,23 @@
+
+# Run the container
+docker run -d \
+  --name messaging-app \
+  -p 8000:8000 \
+  messaging-app:latest
+
+# Or with environment variables
+docker run -d \
+  --name messaging-app \
+  -p 8000:8000 \
+  -e DJANGO_DEBUG=False \
+  -e DJANGO_SECRET_KEY=your-secret-key-here \
+  messaging-app:latest
+
+# Check if container is running
+docker ps
+
+# View logs
+docker logs messaging-app
+
+# If you need to access the container shell
+docker exec -it messaging-app bash
