@@ -1,0 +1,501 @@
+
+#!/bin/bash
+
+# setup-ingress.sh - Kubernetes Ingress Setup for Django App
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+NC='\033[0m' # No Color
+
+# Configuration
+INGRESS_NAMESPACE="ingress-nginx"
+DEPLOYMENT_NAME="django-messaging-app"
+SERVICE_NAME="django-service"
+INGRESS_NAME="django-ingress"
+HOST_NAME="django-app.local"
+DOMAIN_NAME="django.example.com"  # Change this to your domain
+CLUSTER_TYPE="minikube"  # or "kind", "k3s", "generic"
+
+# Logging functions
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step() { echo -e "${PURPLE}[STEP]${NC} $1"; }
+
+# Check prerequisites
+check_prerequisites() {
+    log_step "1. Checking prerequisites..."
+    
+    # Check kubectl
+    if ! command -v kubectl &> /dev/null; then
+        log_error "kubectl is not installed"
+        exit 1
+    fi
+    
+    # Check cluster connectivity
+    if ! kubectl cluster-info &> /dev/null; then
+        log_error "Cannot connect to Kubernetes cluster"
+        exit 1
+    fi
+    
+    # Check if Django app is deployed
+    if ! kubectl get deployment "$DEPLOYMENT_NAME" &> /dev/null; then
+        log_error "Django deployment '$DEPLOYMENT_NAME' not found"
+        log_info "Please deploy the Django app first using Task 1"
+        exit 1
+    fi
+    
+    # Check if service exists
+    if ! kubectl get service "$SERVICE_NAME" &> /dev/null; then
+        log_error "Service '$SERVICE_NAME' not found"
+        exit 1
+    fi
+    
+    log_success "All prerequisites satisfied"
+}
+
+# Detect cluster type
+detect_cluster_type() {
+    log_step "2. Detecting Kubernetes cluster type..."
+    
+    # Check if using Minikube
+    if command -v minikube &> /dev/null && minikube status 2>/dev/null | grep -q "Running"; then
+        CLUSTER_TYPE="minikube"
+        log_info "Detected: Minikube cluster"
+    # Check if using Kind
+    elif command -v kind &> /dev/null && kind get clusters &> /dev/null; then
+        CLUSTER_TYPE="kind"
+        log_info "Detected: Kind cluster"
+    # Check if using k3s
+    elif kubectl get nodes -o jsonpath='{.items[*].status.nodeInfo.kubeletVersion}' | grep -q k3s; then
+        CLUSTER_TYPE="k3s"
+        log_info "Detected: k3s cluster"
+    else
+        CLUSTER_TYPE="generic"
+        log_info "Detected: Generic Kubernetes cluster"
+    fi
+}
+
+# Install Nginx Ingress Controller
+install_ingress_controller() {
+    log_step "3. Installing Nginx Ingress Controller..."
+    
+    # Check if ingress controller already exists
+    if kubectl get pods -n "$INGRESS_NAMESPACE" 2>/dev/null | grep -q ingress; then
+        log_info "Ingress controller already installed in namespace: $INGRESS_NAMESPACE"
+        return 0
+    fi
+    
+    log_info "Creating namespace: $INGRESS_NAMESPACE"
+    kubectl create namespace "$INGRESS_NAMESPACE" 2>/dev/null || true
+    
+    # Different installation methods based on cluster type
+    case "$CLUSTER_TYPE" in
+        "minikube")
+            log_info "Using Minikube addon for ingress"
+            minikube addons enable ingress
+            minikube addons enable ingress-dns
+            
+            # Wait for ingress controller to be ready
+            log_info "Waiting for ingress controller to be ready..."
+            kubectl wait --namespace "$INGRESS_NAMESPACE" \
+                --for=condition=ready pod \
+                --selector=app.kubernetes.io/component=controller \
+                --timeout=120s
+            
+            # Show minikube IP
+            MINIKUBE_IP=$(minikube ip)
+            log_info "Minikube IP: $MINIKUBE_IP"
+            log_info "Add to /etc/hosts: $MINIKUBE_IP $HOST_NAME"
+            ;;
+            
+        "kind")
+            log_info "Installing Nginx Ingress for Kind cluster"
+            kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+            
+            # Wait for ingress controller
+            kubectl wait --namespace "$INGRESS_NAMESPACE" \
+                --for=condition=ready pod \
+                --selector=app.kubernetes.io/component=controller \
+                --timeout=120s
+            ;;
+            
+        "k3s")
+            log_info "K3s has Traefik as default ingress. Installing Nginx instead..."
+            kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.1/deploy/static/provider/cloud/deploy.yaml
+            ;;
+            
+        "generic"|*)
+            log_info "Installing Nginx Ingress Controller using Helm"
+            
+            # Install using Helm if available
+            if command -v helm &> /dev/null; then
+                log_info "Using Helm to install ingress-nginx"
+                helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+                helm repo update
+                helm install ingress-nginx ingress-nginx/ingress-nginx \
+                    --namespace "$INGRESS_NAMESPACE" \
+                    --create-namespace \
+                    --set controller.service.type=LoadBalancer
+            else
+                log_info "Using kubectl to install ingress-nginx"
+                kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.1/deploy/static/provider/cloud/deploy.yaml
+            fi
+            
+            # Wait for ingress controller
+            sleep 10
+            kubectl wait --namespace "$INGRESS_NAMESPACE" \
+                --for=condition=ready pod \
+                --selector=app.kubernetes.io/component=controller \
+                --timeout=180s
+            ;;
+    esac
+    
+    # Verify installation
+    log_info "Verifying ingress controller installation..."
+    kubectl get all -n "$INGRESS_NAMESPACE"
+    
+    # Check ingress controller pods
+    INGRESS_PODS=$(kubectl get pods -n "$INGRESS_NAMESPACE" --no-headers | wc -l)
+    INGRESS_READY=$(kubectl get pods -n "$INGRESS_NAMESPACE" --no-headers | grep -c "Running")
+    
+    if [[ "$INGRESS_READY" -gt 0 ]]; then
+        log_success "Nginx Ingress Controller installed successfully ($INGRESS_READY/$INGRESS_PODS pods ready)"
+    else
+        log_error "Ingress controller installation failed"
+        kubectl describe pods -n "$INGRESS_NAMESPACE"
+        exit 1
+    fi
+}
+
+# Create Ingress Resource YAML
+create_ingress_yaml() {
+    log_step "4. Creating Ingress resource YAML file..."
+    
+    cat > ingress.yaml << EOF
+# ingress.yaml - Ingress configuration for Django Messaging App
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: $INGRESS_NAME
+  namespace: default
+  annotations:
+    # Nginx Ingress Controller annotations
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization"
+    
+    # For production, consider these additional annotations:
+    # nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # nginx.ingress.kubernetes.io/configuration-snippet: |
+    #   more_set_headers "X-Content-Type-Options: nosniff";
+    #   more_set_headers "X-Frame-Options: DENY";
+    #   more_set_headers "X-XSS-Protection: 1; mode=block";
+spec:
+  ingressClassName: nginx
+  rules:
+  # Rule 1: Host-based routing for specific domain
+  - host: $HOST_NAME
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: $SERVICE_NAME
+            port:
+              number: 8000
+  
+  # Rule 2: Path-based routing (multiple services example)
+  - host: $DOMAIN_NAME
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: $SERVICE_NAME
+            port:
+              number: 8000
+      - path: /api/
+        pathType: Prefix
+        backend:
+          service:
+            name: $SERVICE_NAME
+            port:
+              number: 8000
+      - path: /admin/
+        pathType: Prefix
+        backend:
+          service:
+            name: $SERVICE_NAME
+            port:
+              number: 8000
+      - path: /static/
+        pathType: Prefix
+        backend:
+          service:
+            name: $SERVICE_NAME
+            port:
+              number: 8000
+      - path: /media/
+        pathType: Prefix
+        backend:
+          service:
+            name: $SERVICE_NAME
+            port:
+              number: 8000
+  
+  # Rule 3: Catch-all rule (for IP access or wildcard)
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: $SERVICE_NAME
+            port:
+              number: 8000
+EOF
+    
+    log_success "Created ingress.yaml with:"
+    log_info "  - Host-based routing for: $HOST_NAME"
+    log_info "  - Domain-based routing for: $DOMAIN_NAME"
+    log_info "  - Path-based routing for: /, /api/, /admin/, /static/, /media/"
+    log_info "  - Catch-all rule for IP access"
+}
+
+# Apply Ingress configuration
+apply_ingress_configuration() {
+    log_step "5. Applying Ingress configuration..."
+    
+    log_info "Applying ingress.yaml..."
+    kubectl apply -f ingress.yaml
+    
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to apply ingress configuration"
+        exit 1
+    fi
+    
+    log_success "Ingress resource created: $INGRESS_NAME"
+    
+    # Wait for ingress to be ready
+    log_info "Waiting for ingress to be ready..."
+    sleep 10
+    
+    # Check ingress status
+    log_info "Ingress status:"
+    kubectl get ingress
+    
+    # Describe ingress for more details
+    log_info "Ingress details:"
+    kubectl describe ingress "$INGRESS_NAME"
+}
+
+# Update /etc/hosts for local development
+update_hosts_file() {
+    log_step "6. Updating hosts file for local access..."
+    
+    # Get ingress IP address
+    if [[ "$CLUSTER_TYPE" == "minikube" ]]; then
+        INGRESS_IP=$(minikube ip)
+    else
+        # Try to get LoadBalancer IP
+        INGRESS_IP=$(kubectl get service -n "$INGRESS_NAMESPACE" ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+        
+        if [[ -z "$INGRESS_IP" ]]; then
+            INGRESS_IP=$(kubectl get service -n "$INGRESS_NAMESPACE" ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+        fi
+        
+        if [[ -z "$INGRESS_IP" ]]; then
+            INGRESS_IP="127.0.0.1"  # Fallback to localhost
+            log_warning "Could not determine ingress IP. Using $INGRESS_IP"
+        fi
+    fi
+    
+    # Check if entry already exists in /etc/hosts
+    if grep -q "$HOST_NAME" /etc/hosts; then
+        log_info "Host entry already exists in /etc/hosts"
+    else
+        log_info "Adding entry to /etc/hosts (may require sudo password)"
+        echo -e "\n# Django App Ingress" | sudo tee -a /etc/hosts
+        echo "$INGRESS_IP $HOST_NAME" | sudo tee -a /etc/hosts
+        echo "$INGRESS_IP $DOMAIN_NAME" | sudo tee -a /etc/hosts
+        log_success "Updated /etc/hosts with: $INGRESS_IP $HOST_NAME, $DOMAIN_NAME"
+    fi
+}
+
+# Test Ingress configuration
+test_ingress() {
+    log_step "7. Testing Ingress configuration..."
+    
+    # Test using curl
+    log_info "Testing ingress connectivity..."
+    
+    # Test with host header
+    echo -e "\n${YELLOW}Testing $HOST_NAME:${NC}"
+    if curl -s -H "Host: $HOST_NAME" http://$HOST_NAME > /dev/null 2>&1; then
+        curl -s -H "Host: $HOST_NAME" -I http://$HOST_NAME | head -5
+        log_success "✓ Host-based routing working"
+    else
+        log_warning "⚠ Host-based routing test failed"
+    fi
+    
+    # Test different paths
+    PATHS=("/" "/api/" "/admin/" "/static/" "/health/")
+    for path in "${PATHS[@]}"; do
+        echo -e "\n${YELLOW}Testing path $path:${NC}"
+        STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Host: $HOST_NAME" http://$HOST_NAME$path)
+        if [[ "$STATUS_CODE" =~ ^[23] ]]; then
+            log_success "✓ Path $path accessible (HTTP $STATUS_CODE)"
+        else
+            log_warning "⚠ Path $path returned HTTP $STATUS_CODE"
+        fi
+    done
+    
+    # Test without host header (catch-all rule)
+    echo -e "\n${YELLOW}Testing catch-all rule (IP access):${NC}"
+    if [[ "$CLUSTER_TYPE" == "minikube" ]]; then
+        MINIKUBE_IP=$(minikube ip)
+        STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://$MINIKUBE_IP)
+        if [[ "$STATUS_CODE" =~ ^[23] ]]; then
+            log_success "✓ Catch-all rule working (HTTP $STATUS_CODE)"
+        else
+            log_warning "⚠ Catch-all rule test failed (HTTP $STATUS_CODE)"
+        fi
+    fi
+}
+
+# Create commands.txt file
+create_commands_file() {
+    log_step "8. Creating commands.txt file..."
+    
+    cat > commands.txt << EOF
+# Kubernetes Ingress Setup Commands
+# =================================
+
+# 1. Install Nginx Ingress Controller
+
+# For Minikube:
+minikube addons enable ingress
+minikube addons enable ingress-dns
+
+# For generic Kubernetes clusters:
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.1/deploy/static/provider/cloud/deploy.yaml
+
+# Wait for ingress controller to be ready:
+kubectl wait --namespace ingress-nginx \\
+  --for=condition=ready pod \\
+  --selector=app.kubernetes.io/component=controller \\
+  --timeout=120s
+
+# 2. Apply Ingress configuration
+kubectl apply -f ingress.yaml
+
+# 3. Check Ingress status
+kubectl get ingress
+kubectl describe ingress django-ingress
+
+# 4. Get Ingress IP/address
+kubectl get service -n ingress-nginx ingress-nginx-controller
+
+# 5. Test Ingress connectivity
+curl -H "Host: django-app.local" http://django-app.local
+curl -H "Host: django-app.local" http://django-app.local/api/
+curl -H "Host: django-app.local" http://django-app.local/admin/
+
+# 6. Update local hosts file (for development)
+echo "\$(minikube ip) django-app.local django.example.com" | sudo tee -a /etc/hosts
+
+# 7. View Ingress controller logs
+kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller
+
+# 8. Delete Ingress resources
+kubectl delete -f ingress.yaml
+kubectl delete namespace ingress-nginx
+
+# 9. For Minikube, disable ingress addon
+minikube addons disable ingress
+EOF
+    
+    log_success "Created commands.txt with all Ingress-related commands"
+    
+    # Also create a simple one-line command as requested
+    echo -e "\n${YELLOW}Main command used to apply Ingress configuration:${NC}"
+    echo "kubectl apply -f ingress.yaml" | tee -a commands.txt
+}
+
+# Display summary
+display_summary() {
+    log_step "9. Ingress Setup Summary"
+    
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}     INGRESS SETUP COMPLETE           ${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    
+    # Get ingress details
+    INGRESS_INFO=$(kubectl get ingress "$INGRESS_NAME" -o jsonpath='{.status.loadBalancer.ingress[0]}' 2>/dev/null)
+    
+    echo -e "${BLUE}Ingress Resource:${NC}"
+    echo "  Name: $INGRESS_NAME"
+    echo "  Hosts configured:"
+    echo "    - http://$HOST_NAME"
+    echo "    - http://$DOMAIN_NAME"
+    echo "    - IP-based access (catch-all)"
+    
+    echo -e "\n${BLUE}Configured Paths:${NC}"
+    echo "  /       → Django app root"
+    echo "  /api/   → Django API"
+    echo "  /admin/ → Django admin"
+    echo "  /static/ → Static files"
+    echo "  /media/ → Media files"
+    
+    if [[ "$CLUSTER_TYPE" == "minikube" ]]; then
+        MINIKUBE_IP=$(minikube ip)
+        echo -e "\n${BLUE}Access URLs:${NC}"
+        echo "  With host header: curl -H 'Host: $HOST_NAME' http://$MINIKUBE_IP"
+        echo "  Direct IP access: curl http://$MINIKUBE_IP"
+        echo -e "\n${YELLOW}Add to /etc/hosts:${NC}"
+        echo "  $MINIKUBE_IP $HOST_NAME $DOMAIN_NAME"
+    fi
+    
+    echo -e "\n${BLUE}Files Created:${NC}"
+    echo "  ✓ ingress.yaml - Ingress configuration"
+    echo "  ✓ commands.txt - All commands used"
+    
+    echo -e "\n${BLUE}Next Steps:${NC}"
+    echo "  1. Test: curl -H 'Host: $HOST_NAME' http://localhost"
+    echo "  2. Check: kubectl get ingress"
+    echo "  3. Monitor: kubectl logs -n $INGRESS_NAMESPACE -l app.kubernetes.io/component=controller"
+}
+
+# Main execution
+main() {
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}  Kubernetes Ingress Setup for Django  ${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    
+    check_prerequisites
+    detect_cluster_type
+    install_ingress_controller
+    create_ingress_yaml
+    apply_ingress_configuration
+    update_hosts_file
+    test_ingress
+    create_commands_file
+    display_summary
+}
+
+# Run main function
+main "$@"
