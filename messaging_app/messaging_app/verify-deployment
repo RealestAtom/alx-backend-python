@@ -1,0 +1,45 @@
+
+#!/bin/bash
+# verify-deployment.sh
+
+echo "Verifying Django Messaging App Deployment..."
+echo "============================================"
+
+# Check all components
+echo -e "\n1. Checking all Kubernetes resources:"
+kubectl get all -l app=django-messaging
+
+# Check pods in detail
+echo -e "\n2. Detailed pod status:"
+kubectl get pods -l app=django-messaging -o wide
+
+# Check pod events
+echo -e "\n3. Pod events:"
+kubectl describe pods -l app=django-messaging | grep -A 20 "Events:"
+
+# Check deployment status
+echo -e "\n4. Deployment rollout status:"
+kubectl rollout status deployment/django-messaging-app
+
+# Check service endpoints
+echo -e "\n5. Service endpoints:"
+kubectl describe service django-service | grep -A 10 "Endpoints:"
+
+# Test connectivity inside cluster
+echo -e "\n6. Testing internal connectivity (from another pod):"
+kubectl run test-curl --image=curlimages/curl:8.2.1 --rm -it --restart=Never -- \
+    curl -s -o /dev/null -w "%{http_code}" http://django-service:8000/health/ && echo " - Connection successful" || echo " - Connection failed"
+
+# Check logs
+echo -e "\n7. Checking application logs:"
+POD_NAME=$(kubectl get pods -l app=django-messaging -o jsonpath='{.items[0].metadata.name}')
+echo "Pod: $POD_NAME"
+echo "Last 10 lines of logs:"
+kubectl logs $POD_NAME --tail=10
+
+# Resource usage
+echo -e "\n8. Resource usage:"
+kubectl top pods -l app=django-messaging 2>/dev/null || echo "Metrics not available. Run: kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml"
+
+echo -e "\n============================================"
+echo "Verification complete!"
