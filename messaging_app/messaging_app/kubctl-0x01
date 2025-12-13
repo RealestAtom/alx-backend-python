@@ -1,0 +1,430 @@
+
+#!/bin/bash
+
+# kubctl-0x01 - Kubernetes Scaling and Load Testing Script
+# Objective: Scale Django app, verify, load test, and monitor resources
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Configuration
+DEPLOYMENT_NAME="django-messaging-app"
+NAMESPACE="default"
+SERVICE_NAME="django-service"
+TARGET_REPLICAS=3
+LOAD_TEST_DURATION="30s"
+LOAD_TEST_CONNECTIONS=10
+LOAD_TEST_THREADS=2
+LOAD_TEST_URL="http://localhost:8000"  # Will be updated with actual service URL
+
+# Logging functions
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step() { echo -e "${PURPLE}[STEP]${NC} $1"; }
+log_result() { echo -e "${CYAN}[RESULT]${NC} $1"; }
+
+# Check prerequisites
+check_prerequisites() {
+    log_step "1. Checking prerequisites..."
+    
+    # Check kubectl
+    if ! command -v kubectl &> /dev/null; then
+        log_error "kubectl is not installed. Please install it first."
+        exit 1
+    fi
+    
+    # Check kubectl connectivity
+    if ! kubectl cluster-info &> /dev/null; then
+        log_error "Cannot connect to Kubernetes cluster. Is it running?"
+        exit 1
+    fi
+    
+    # Check if deployment exists
+    if ! kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" &> /dev/null; then
+        log_error "Deployment '$DEPLOYMENT_NAME' not found in namespace '$NAMESPACE'"
+        log_info "Please deploy the Django app first using Task 1"
+        exit 1
+    fi
+    
+    # Check if metrics-server is installed (for kubectl top)
+    if ! kubectl top nodes &> /dev/null; then
+        log_warning "metrics-server not installed. Installing..."
+        kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+        # Wait for metrics-server to be ready
+        kubectl wait --for=condition=available deployment/metrics-server -n kube-system --timeout=120s
+    fi
+    
+    log_success "All prerequisites satisfied"
+}
+
+# Get current deployment status
+get_current_status() {
+    log_step "2. Getting current deployment status..."
+    
+    log_info "Current deployment:"
+    kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o wide
+    
+    CURRENT_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')
+    READY_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}')
+    AVAILABLE_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o jsonpath='{.status.availableReplicas}')
+    
+    log_result "Current replicas: $CURRENT_REPLICAS"
+    log_result "Ready replicas: $READY_REPLICAS"
+    log_result "Available replicas: $AVAILABLE_REPLICAS"
+    
+    log_info "Current pods:"
+    kubectl get pods -n "$NAMESPACE" -l app=django-messaging -o wide
+    
+    log_info "Service status:"
+    kubectl get service "$SERVICE_NAME" -n "$NAMESPACE" -o wide
+}
+
+# Scale the deployment
+scale_deployment() {
+    log_step "3. Scaling deployment to $TARGET_REPLICAS replicas..."
+    
+    # Get current replicas
+    CURRENT_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')
+    
+    if [[ "$CURRENT_REPLICAS" -eq "$TARGET_REPLICAS" ]]; then
+        log_info "Deployment already has $TARGET_REPLICAS replicas"
+        return 0
+    fi
+    
+    log_info "Scaling from $CURRENT_REPLICAS to $TARGET_REPLICAS replicas..."
+    kubectl scale deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" --replicas="$TARGET_REPLICAS"
+    
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to scale deployment"
+        return 1
+    fi
+    
+    # Wait for scaling to complete
+    log_info "Waiting for pods to be ready..."
+    kubectl rollout status deployment/"$DEPLOYMENT_NAME" -n "$NAMESPACE" --timeout=120s
+    
+    if [[ $? -eq 0 ]]; then
+        log_success "Successfully scaled to $TARGET_REPLICAS replicas"
+    else
+        log_error "Scaling completed with issues"
+        kubectl get pods -n "$NAMESPACE" -l app=django-messaging
+        return 1
+    fi
+    
+    return 0
+}
+
+# Verify scaled deployment
+verify_scaling() {
+    log_step "4. Verifying scaled deployment..."
+    
+    # Get updated status
+    READY_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}')
+    AVAILABLE_REPLICAS=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o jsonpath='{.status.availableReplicas}')
+    
+    log_info "Deployment status after scaling:"
+    kubectl get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o wide
+    
+    if [[ "$READY_REPLICAS" -eq "$TARGET_REPLICAS" && "$AVAILABLE_REPLICAS" -eq "$TARGET_REPLICAS" ]]; then
+        log_success "All $TARGET_REPLICAS replicas are ready and available"
+    else
+        log_warning "Scaling incomplete. Ready: $READY_REPLICAS, Available: $AVAILABLE_REPLICAS"
+    fi
+    
+    # Show all pods
+    log_info "All pods (should show $TARGET_REPLICAS pods):"
+    kubectl get pods -n "$NAMESPACE" -l app=django-messaging -o wide
+    
+    # Show pod distribution across nodes
+    log_info "Pod distribution across nodes:"
+    kubectl get pods -n "$NAMESPACE" -l app=django-messaging -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort | uniq -c | sort -rn
+    
+    # Show pod IPs
+    log_info "Pod IP addresses:"
+    kubectl get pods -n "$NAMESPACE" -l app=django-messaging -o jsonpath='{range .items[*]}{.status.podIP}{"\t"}{.metadata.name}{"\n"}{end}'
+    
+    # Show service endpoints
+    log_info "Service endpoints (should list $TARGET_REPLICAS endpoints):"
+    kubectl describe service "$SERVICE_NAME" -n "$NAMESPACE" | grep -A 20 "Endpoints:"
+    
+    return 0
+}
+
+# Setup port-forwarding for load testing
+setup_port_forward() {
+    log_step "5. Setting up port-forwarding for load testing..."
+    
+    # Kill any existing port-forward
+    pkill -f "kubectl port-forward" 2>/dev/null || true
+    sleep 2
+    
+    # Start port-forward in background
+    log_info "Starting port-forward to service $SERVICE_NAME..."
+    kubectl port-forward service/"$SERVICE_NAME" -n "$NAMESPACE" 8000:8000 > /tmp/k8s-port-forward.log 2>&1 &
+    PORT_FORWARD_PID=$!
+    
+    # Wait for port-forward to establish
+    sleep 5
+    
+    # Check if port-forward is working
+    if ! ss -tln | grep -q ":8000"; then
+        log_error "Port-forward failed to establish"
+        cat /tmp/k8s-port-forward.log
+        kill $PORT_FORWARD_PID 2>/dev/null
+        return 1
+    fi
+    
+    # Test the connection
+    if curl -s --connect-timeout 5 http://localhost:8000 > /dev/null; then
+        log_success "Port-forward established (PID: $PORT_FORWARD_PID)"
+        LOAD_TEST_URL="http://localhost:8000"
+        echo $PORT_FORWARD_PID > /tmp/port_forward_pid
+    else
+        log_error "Service not accessible via port-forward"
+        kill $PORT_FORWARD_PID 2>/dev/null
+        return 1
+    fi
+    
+    return 0
+}
+
+# Install wrk if not present
+install_wrk() {
+    log_step "6. Checking/installing wrk for load testing..."
+    
+    if command -v wrk &> /dev/null; then
+        log_success "wrk is already installed"
+        return 0
+    fi
+    
+    log_info "Installing wrk..."
+    
+    OS=$(uname -s)
+    if [[ "$OS" == "Linux" ]]; then
+        # Ubuntu/Debian
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y wrk
+        # CentOS/RHEL
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y epel-release
+            sudo yum install -y wrk
+        else
+            log_error "Cannot install wrk automatically on this Linux distribution"
+            log_info "Please install wrk manually: https://github.com/wg/wrk"
+            return 1
+        fi
+    elif [[ "$OS" == "Darwin" ]]; then
+        brew install wrk
+    else
+        log_error "Unsupported OS: $OS"
+        return 1
+    fi
+    
+    if command -v wrk &> /dev/null; then
+        log_success "wrk installed successfully"
+    else
+        log_error "Failed to install wrk"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Perform load testing
+perform_load_test() {
+    log_step "7. Performing load testing..."
+    
+    if ! setup_port_forward; then
+        log_error "Cannot perform load testing without port-forwarding"
+        return 1
+    fi
+    
+    log_info "Load testing configuration:"
+    log_info "  URL: $LOAD_TEST_URL"
+    log_info "  Duration: $LOAD_TEST_DURATION"
+    log_info "  Connections: $LOAD_TEST_CONNECTIONS"
+    log_info "  Threads: $LOAD_TEST_THREADS"
+    
+    # Create a simple health endpoint if not exists (for Django)
+    log_info "Testing endpoint availability..."
+    if ! curl -s --max-time 10 "$LOAD_TEST_URL/health/" > /dev/null 2>&1; then
+        log_warning "/health/ endpoint not found, trying root endpoint..."
+        if ! curl -s --max-time 10 "$LOAD_TEST_URL" > /dev/null 2>&1; then
+            log_error "Cannot reach Django app. Is it running?"
+            return 1
+        fi
+        TEST_ENDPOINT="$LOAD_TEST_URL"
+    else
+        TEST_ENDPOINT="$LOAD_TEST_URL/health/"
+    fi
+    
+    log_info "Starting load test on: $TEST_ENDPOINT"
+    echo -e "${YELLOW}========================================${NC}"
+    echo -e "${YELLOW}          LOAD TEST RESULTS            ${NC}"
+    echo -e "${YELLOW}========================================${NC}"
+    
+    # Run wrk load test
+    wrk -t"$LOAD_TEST_THREADS" -c"$LOAD_TEST_CONNECTIONS" -d"$LOAD_TEST_DURATION" --latency "$TEST_ENDPOINT"
+    
+    WRK_EXIT_CODE=$?
+    
+    echo -e "${YELLOW}========================================${NC}"
+    
+    if [[ $WRK_EXIT_CODE -eq 0 ]]; then
+        log_success "Load test completed successfully"
+    else
+        log_error "Load test failed with exit code: $WRK_EXIT_CODE"
+    fi
+    
+    # Clean up port-forward
+    if [[ -f /tmp/port_forward_pid ]]; then
+        PORT_FORWARD_PID=$(cat /tmp/port_forward_pid)
+        kill $PORT_FORWARD_PID 2>/dev/null
+        rm -f /tmp/port_forward_pid
+    fi
+    
+    return $WRK_EXIT_CODE
+}
+
+# Monitor resource usage
+monitor_resources() {
+    log_step "8. Monitoring resource usage..."
+    
+    log_info "Node resource usage:"
+    if kubectl top nodes 2>/dev/null; then
+        log_success "Node metrics retrieved"
+    else
+        log_warning "Cannot get node metrics. Ensure metrics-server is running."
+        kubectl get pods -n kube-system | grep metrics-server
+    fi
+    
+    log_info "Pod resource usage (before load test snapshot):"
+    echo -e "${CYAN}CPU/Memory usage per pod:${NC}"
+    if kubectl top pods -n "$NAMESPACE" -l app=django-messaging 2>/dev/null; then
+        log_success "Pod metrics retrieved"
+        
+        # Calculate averages
+        echo -e "\n${CYAN}Resource usage summary:${NC}"
+        kubectl top pods -n "$NAMESPACE" -l app=django-messaging --no-headers 2>/dev/null | \
+        awk '
+        {
+            cpu_sum += $2;
+            mem_sum += $3;
+            count++;
+        }
+        END {
+            if (count > 0) {
+                printf "Average CPU per pod: %.1fm\n", cpu_sum/count;
+                printf "Average Memory per pod: %.1fMi\n", mem_sum/count;
+                printf "Total CPU: %.1fm\n", cpu_sum;
+                printf "Total Memory: %.1fMi\n", mem_sum;
+            }
+        }'
+    else
+        log_warning "Cannot get pod metrics"
+    fi
+    
+    # Monitor for a period during load test
+    log_info "Monitoring resource usage during next 30 seconds..."
+    echo -e "${CYAN}Timestamp           Pod Name                 CPU    Memory${NC}"
+    
+    for i in {1..6}; do
+        sleep 5
+        TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+        METRICS=$(kubectl top pods -n "$NAMESPACE" -l app=django-messaging --no-headers 2>/dev/null | head -1)
+        if [[ -n "$METRICS" ]]; then
+            echo -e "${BLUE}$TIMESTAMP${NC} $METRICS"
+        fi
+    done
+    
+    # Show resource requests/limits
+    log_info "Pod resource requests and limits:"
+    kubectl get pods -n "$NAMESPACE" -l app=django-messaging -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[0].resources.requests.cpu}{"\t"}{.spec.containers[0].resources.limits.cpu}{"\t"}{.spec.containers[0].resources.requests.memory}{"\t"}{.spec.containers[0].resources.limits.memory}{"\n"}{end}' | \
+    awk 'BEGIN {printf "%-25s %-10s %-10s %-15s %-15s\n", "Pod Name", "Req CPU", "Limit CPU", "Req Memory", "Limit Memory"} 
+         {printf "%-25s %-10s %-10s %-15s %-15s\n", $1, $2, $3, $4, $5}'
+    
+    return 0
+}
+
+# Compare before/after scaling
+compare_metrics() {
+    log_step "9. Comparing metrics before and after scaling..."
+    
+    # Get current metrics
+    CURRENT_PODS=$(kubectl get pods -n "$NAMESPACE" -l app=django-messaging --no-headers | wc -l)
+    CURRENT_READY=$(kubectl get pods -n "$NAMESPACE" -l app=django-messaging --no-headers | grep -c "Running")
+    
+    log_info "Scaling Summary:"
+    log_result "Target replicas: $TARGET_REPLICAS"
+    log_result "Current pods: $CURRENT_PODS"
+    log_result "Running pods: $CURRENT_READY"
+    
+    if [[ "$CURRENT_READY" -eq "$TARGET_REPLICAS" ]]; then
+        log_success "✓ Scaling successful: All $TARGET_REPLICAS pods are running"
+    else
+        log_warning "⚠ Scaling incomplete: $CURRENT_READY/$TARGET_REPLICAS pods running"
+    fi
+    
+    # Show HPA status if configured
+    if kubectl get hpa -n "$NAMESPACE" 2>/dev/null | grep -q "$DEPLOYMENT_NAME"; then
+        log_info "Horizontal Pod Autoscaler status:"
+        kubectl get hpa "$DEPLOYMENT_NAME" -n "$NAMESPACE"
+    fi
+}
+
+# Main execution
+main() {
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}  Kubernetes Scaling & Load Testing    ${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    
+    # Record start time
+    START_TIME=$(date +%s)
+    
+    # Execute all steps
+    check_prerequisites
+    get_current_status
+    scale_deployment
+    verify_scaling
+    
+    # Load testing (optional - user can skip)
+    read -p "Do you want to perform load testing? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        install_wrk
+        perform_load_test
+    else
+        log_info "Skipping load testing"
+    fi
+    
+    monitor_resources
+    compare_metrics
+    
+    # Calculate total time
+    END_TIME=$(date +%s)
+    DURATION=$((END_TIME - START_TIME))
+    
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}          TASK COMPLETED               ${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    log_success "Total execution time: ${DURATION}s"
+    
+    echo -e "\n${CYAN}Useful commands:${NC}"
+    echo "  kubectl get pods -l app=django-messaging"
+    echo "  kubectl describe deployment $DEPLOYMENT_NAME"
+    echo "  kubectl top pods -l app=django-messaging"
+    echo "  kubectl logs -l app=django-messaging --tail=10"
+    echo "  kubectl scale deployment $DEPLOYMENT_NAME --replicas=1"
+}
+
+# Run main function
+main "$@"
