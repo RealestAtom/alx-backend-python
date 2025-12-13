@@ -1,0 +1,434 @@
+
+#!/bin/bash
+
+# kubctl-0x02 - Blue-Green Deployment Script
+# Objective: Deploy blue and green versions, switch traffic, monitor logs
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Configuration
+NAMESPACE="default"
+BLUE_DEPLOYMENT="django-app-blue"
+GREEN_DEPLOYMENT="django-app-green"
+MAIN_SERVICE="django-app-service"
+BLUE_SERVICE="django-app-blue-service"
+GREEN_SERVICE="django-app-green-service"
+BLUE_VERSION="v1.0.0"
+GREEN_VERSION="v1.1.0"
+DEPLOYMENT_FILES=("blue_deployment.yaml" "green_deployment.yaml" "kubeservice.yaml")
+
+# Traffic weights (percentage to green)
+TRAFFIC_SPLIT=0  # Start with 0% to green
+FINAL_TRAFFIC=100  # End with 100% to green
+
+# Logging functions
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step() { echo -e "${PURPLE}[STEP]${NC} $1"; }
+log_debug() { echo -e "${CYAN}[DEBUG]${NC} $1"; }
+
+# Check prerequisites
+check_prerequisites() {
+    log_step "1. Checking prerequisites..."
+    
+    # Check kubectl
+    if ! command -v kubectl &> /dev/null; then
+        log_error "kubectl is not installed"
+        exit 1
+    fi
+    
+    # Check cluster connectivity
+    if ! kubectl cluster-info &> /dev/null; then
+        log_error "Cannot connect to Kubernetes cluster"
+        exit 1
+    fi
+    
+    # Check deployment files exist
+    for file in "${DEPLOYMENT_FILES[@]}"; do
+        if [[ ! -f "$file" ]]; then
+            log_error "Missing deployment file: $file"
+            exit 1
+        fi
+    done
+    
+    log_success "All prerequisites satisfied"
+}
+
+# Deploy blue version (initial deployment)
+deploy_blue() {
+    log_step "2. Deploying Blue version ($BLUE_VERSION)..."
+    
+    log_info "Applying blue deployment..."
+    kubectl apply -f blue_deployment.yaml
+    
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to deploy blue version"
+        exit 1
+    fi
+    
+    # Wait for blue deployment to be ready
+    log_info "Waiting for blue deployment to be ready..."
+    kubectl rollout status deployment/$BLUE_DEPLOYMENT --timeout=120s
+    
+    if [[ $? -eq 0 ]]; then
+        log_success "Blue deployment is ready"
+        
+        # Check blue deployment logs
+        log_info "Checking blue deployment logs for errors..."
+        BLUE_POD=$(kubectl get pods -l version=blue -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [[ -n "$BLUE_POD" ]]; then
+            log_debug "Blue pod: $BLUE_POD"
+            kubectl logs $BLUE_POD --tail=10 | grep -i "error\|exception\|fail" || true
+        fi
+    else
+        log_error "Blue deployment failed to become ready"
+        kubectl describe deployment/$BLUE_DEPLOYMENT
+        exit 1
+    fi
+}
+
+# Deploy main service (initially pointing to blue)
+deploy_main_service() {
+    log_step "3. Deploying main service (initially pointing to Blue)..."
+    
+    log_info "Applying main service configuration..."
+    kubectl apply -f kubeservice.yaml
+    
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to deploy main service"
+        exit 1
+    fi
+    
+    # Verify service endpoints point to blue
+    log_info "Verifying service endpoints..."
+    ENDPOINTS=$(kubectl get endpoints $MAIN_SERVICE -o jsonpath='{.subsets[0].addresses[*].targetRef.name}' 2>/dev/null)
+    
+    if echo "$ENDPOINTS" | grep -q "blue"; then
+        log_success "Main service is correctly routing to Blue deployment"
+        log_debug "Current endpoints: $ENDPOINTS"
+    else
+        log_error "Main service not pointing to Blue deployment"
+        kubectl describe service $MAIN_SERVICE
+        exit 1
+    fi
+}
+
+# Test blue deployment
+test_blue_deployment() {
+    log_step "4. Testing Blue deployment..."
+    
+    # Create a test pod to access the service
+    log_info "Testing blue service internally..."
+    kubectl run test-blue --image=curlimages/curl:8.2.1 --rm -it --restart=Never -- \
+        curl -s -o /dev/null -w "HTTP Status: %{http_code}\n" http://$BLUE_SERVICE:8000/health/ || true
+    
+    # Test main service (should route to blue)
+    log_info "Testing main service (should route to blue)..."
+    kubectl run test-main --image=curlimages/curl:8.2.1 --rm -it --restart=Never -- \
+        curl -s -o /dev/null -w "HTTP Status: %{http_code}\n" http://$MAIN_SERVICE:8000/health/ || true
+    
+    log_success "Blue deployment testing completed"
+}
+
+# Deploy green version (new version)
+deploy_green() {
+    log_step "5. Deploying Green version ($GREEN_VERSION) alongside Blue..."
+    
+    log_info "Applying green deployment..."
+    kubectl apply -f green_deployment.yaml
+    
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to deploy green version"
+        exit 1
+    fi
+    
+    # Wait for green deployment to be ready
+    log_info "Waiting for green deployment to be ready..."
+    kubectl rollout status deployment/$GREEN_DEPLOYMENT --timeout=120s
+    
+    if [[ $? -eq 0 ]]; then
+        log_success "Green deployment is ready"
+    else
+        log_error "Green deployment failed to become ready"
+        kubectl describe deployment/$GREEN_DEPLOYMENT
+        exit 1
+    fi
+}
+
+# Check green deployment logs for errors
+check_green_logs() {
+    log_step "6. Checking Green deployment logs for errors..."
+    
+    # Get green pods
+    GREEN_PODS=$(kubectl get pods -l version=green -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+    
+    if [[ -z "$GREEN_PODS" ]]; then
+        log_error "No green pods found"
+        return 1
+    fi
+    
+    log_info "Found green pods: $GREEN_PODS"
+    
+    # Check logs for each green pod
+    ERROR_FOUND=0
+    for pod in $GREEN_PODS; do
+        log_info "Checking logs for pod: $pod"
+        
+        # Get last 20 lines of logs
+        LOGS=$(kubectl logs $pod --tail=20 2>/dev/null)
+        
+        # Check for common error patterns
+        if echo "$LOGS" | grep -q -i "error\|exception\|fail\|crash\|panic"; then
+            log_error "Errors found in pod $pod:"
+            echo "$LOGS" | grep -i "error\|exception\|fail\|crash\|panic" | head -5
+            ERROR_FOUND=1
+        else
+            log_success "No errors found in pod $pod"
+        fi
+        
+        # Check if application started successfully
+        if echo "$LOGS" | grep -q -i "started\|ready\|running"; then
+            log_debug "Pod $pod started successfully"
+        fi
+    done
+    
+    # Detailed log inspection
+    log_info "Detailed log analysis for first green pod..."
+    FIRST_GREEN_POD=$(echo $GREEN_PODS | awk '{print $1}')
+    
+    if [[ -n "$FIRST_GREEN_POD" ]]; then
+        log_debug "Last 30 lines of logs from $FIRST_GREEN_POD:"
+        kubectl logs $FIRST_GREEN_POD --tail=30 2>/dev/null | tail -10
+        
+        # Check container status
+        log_info "Container status for $FIRST_GREEN_POD:"
+        kubectl describe pod $FIRST_GREEN_POD | grep -A 5 "State:"
+    fi
+    
+    if [[ $ERROR_FOUND -eq 0 ]]; then
+        log_success "Green deployment logs look clean"
+        return 0
+    else
+        log_warning "Errors detected in green deployment logs"
+        return 1
+    fi
+}
+
+# Test green deployment independently
+test_green_deployment() {
+    log_step "7. Testing Green deployment independently..."
+    
+    # Test green service directly (not through main service)
+    log_info "Testing green service directly..."
+    kubectl run test-green --image=curlimages/curl:8.2.1 --rm -it --restart=Never -- \
+        curl -s -o /dev/null -w "HTTP Status: %{http_code}\n" http://$GREEN_SERVICE:8000/health/ || true
+    
+    # Compare blue and green responses
+    log_info "Comparing Blue and Green versions..."
+    
+    cat > /tmp/compare_versions.sh << 'EOF'
+#!/bin/bash
+BLUE_RESP=$(kubectl run test-blue-compare --image=curlimages/curl:8.2.1 --rm -i --restart=Never -- curl -s http://django-app-blue-service:8000/health/ 2>/dev/null)
+GREEN_RESP=$(kubectl run test-green-compare --image=curlimages/curl:8.2.1 --rm -i --restart=Never -- curl -s http://django-app-green-service:8000/health/ 2>/dev/null)
+
+echo "Blue version response: $BLUE_RESP"
+echo "Green version response: $GREEN_RESP"
+
+if [[ "$BLUE_RESP" == "$GREEN_RESP" ]]; then
+    echo "✓ Both versions return similar responses"
+else
+    echo "⚠ Version responses differ (expected for new features)"
+fi
+EOF
+    
+    chmod +x /tmp/compare_versions.sh
+    /tmp/compare_versions.sh
+    
+    log_success "Green deployment testing completed"
+}
+
+# Switch traffic gradually from blue to green
+switch_traffic() {
+    log_step "8. Switching traffic from Blue to Green..."
+    
+    # Method 1: Update service selector (instant switch)
+    log_info "Method 1: Updating main service selector to point to Green..."
+    
+    # Backup current service
+    kubectl get service $MAIN_SERVICE -o yaml > $MAIN_SERVICE-backup.yaml
+    
+    # Patch service to switch to green
+    kubectl patch service $MAIN_SERVICE -p '{"spec":{"selector":{"version":"green"}}}'
+    
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to switch service to green"
+        return 1
+    fi
+    
+    # Verify the switch
+    sleep 5
+    log_info "Verifying traffic switch..."
+    ENDPOINTS=$(kubectl get endpoints $MAIN_SERVICE -o jsonpath='{.subsets[0].addresses[*].targetRef.name}' 2>/dev/null)
+    
+    if echo "$ENDPOINTS" | grep -q "green" && ! echo "$ENDPOINTS" | grep -q "blue"; then
+        log_success "Traffic successfully switched to Green deployment"
+        log_debug "Current endpoints: $ENDPOINTS"
+    else
+        log_error "Traffic switch incomplete"
+        kubectl describe service $MAIN_SERVICE
+        return 1
+    fi
+    
+    # Method 2: Gradual traffic switch using Istio-like approach (if available)
+    log_info "Method 2: For gradual traffic split (if using Istio/Service Mesh)..."
+    cat > /tmp/traffic-split.yaml << 'EOF'
+# Example traffic split configuration (for Istio)
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: django-app-vs
+spec:
+  hosts:
+  - django-app-service
+  http:
+  - route:
+    - destination:
+        host: django-app-blue-service
+        port:
+          number: 8000
+      weight: 0  # 0% to blue
+    - destination:
+        host: django-app-green-service
+        port:
+          number: 8000
+      weight: 100  # 100% to green
+EOF
+    
+    log_debug "Gradual traffic split YAML created at /tmp/traffic-split.yaml"
+    
+    return 0
+}
+
+# Monitor deployment after switch
+monitor_after_switch() {
+    log_step "9. Monitoring after traffic switch..."
+    
+    log_info "Current deployment status:"
+    kubectl get deployments -l app=django-messaging
+    
+    log_info "Pod status:"
+    kubectl get pods -l app=django-messaging -o wide
+    
+    log_info "Service endpoints:"
+    kubectl describe service $MAIN_SERVICE | grep -A 10 "Endpoints:"
+    
+    # Test main service after switch (should route to green)
+    log_info "Testing main service after switch (should route to green)..."
+    kubectl run test-after-switch --image=curlimages/curl:8.2.1 --rm -it --restart=Never -- \
+        curl -s http://$MAIN_SERVICE:8000/health/ 2>/dev/null | grep -i "green\|version" || true
+    
+    # Monitor green deployment logs in real-time for a few seconds
+    log_info "Monitoring green deployment logs (10 seconds)..."
+    GREEN_POD=$(kubectl get pods -l version=green -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [[ -n "$GREEN_POD" ]]; then
+        timeout 10 kubectl logs $GREEN_POD --tail=5 -f 2>/dev/null || true
+    fi
+    
+    log_success "Monitoring completed"
+}
+
+# Optional: Rollback to blue if issues detected
+create_rollback_script() {
+    log_step "10. Creating rollback script..."
+    
+    cat > rollback.sh << 'EOF'
+#!/bin/bash
+# rollback.sh - Rollback to Blue deployment
+
+echo "Rolling back to Blue deployment..."
+echo "=================================="
+
+# Switch service back to blue
+kubectl patch service django-app-service -p '{"spec":{"selector":{"version":"blue"}}}'
+
+# Verify rollback
+echo "Verifying rollback..."
+sleep 5
+kubectl describe service django-app-service | grep -A 5 "Endpoints:"
+
+# Scale down green deployment
+kubectl scale deployment django-app-green --replicas=0
+
+echo "Rollback completed! Traffic is now routed to Blue deployment."
+echo "Green deployment scaled to 0 replicas."
+EOF
+    
+    chmod +x rollback.sh
+    log_success "Rollback script created: ./rollback.sh"
+}
+
+# Display summary
+display_summary() {
+    log_step "Blue-Green Deployment Summary"
+    
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}   BLUE-GREEN DEPLOYMENT COMPLETE     ${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    
+    # Show current state
+    echo -e "${BLUE}Current State:${NC}"
+    echo "  Blue Deployment:  $(kubectl get deployment $BLUE_DEPLOYMENT -o jsonpath='{.status.readyReplicas}/{.spec.replicas}' 2>/dev/null || echo 'N/A') pods ready"
+    echo "  Green Deployment: $(kubectl get deployment $GREEN_DEPLOYMENT -o jsonpath='{.status.readyReplicas}/{.spec.replicas}' 2>/dev/null || echo 'N/A') pods ready"
+    echo "  Active Traffic:   $(kubectl get endpoints $MAIN_SERVICE -o jsonpath='{.subsets[0].addresses[*].targetRef.name}' 2>/dev/null | grep -o 'green\|blue' | head -1 || echo 'Unknown')"
+    
+    echo -e "\n${BLUE}Deployment Files Created/Used:${NC}"
+    echo "  ✓ blue_deployment.yaml  - Version $BLUE_VERSION"
+    echo "  ✓ green_deployment.yaml - Version $GREEN_VERSION"
+    echo "  ✓ kubeservice.yaml      - Main traffic router"
+    
+    echo -e "\n${BLUE}Services:${NC}"
+    kubectl get services -l app=django-messaging
+    
+    echo -e "\n${YELLOW}To test the deployment:${NC}"
+    echo "  curl -H 'Host: django-app.local' http://\$(minikube ip)"
+    echo "  kubectl logs -l version=green --tail=10"
+    
+    echo -e "\n${YELLOW}To rollback to Blue:${NC}"
+    echo "  ./rollback.sh"
+    
+    echo -e "\n${YELLOW}To clean up:${NC}"
+    echo "  kubectl delete -f blue_deployment.yaml"
+    echo "  kubectl delete -f green_deployment.yaml"
+    echo "  kubectl delete -f kubeservice.yaml"
+}
+
+# Main execution
+main() {
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}   Blue-Green Deployment Strategy      ${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    
+    check_prerequisites
+    deploy_blue
+    deploy_main_service
+    test_blue_deployment
+    deploy_green
+    check_green_logs
+    test_green_deployment
+    switch_traffic
+    monitor_after_switch
+    create_rollback_script
+    display_summary
+}
+
+# Run main function
+main "$@"
