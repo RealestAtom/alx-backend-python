@@ -1,0 +1,81 @@
+
+# green_deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: django-app-green
+  labels:
+    app: django-messaging
+    version: green
+    track: canary
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: django-messaging
+      version: green
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: django-messaging
+        version: green
+        track: canary
+    spec:
+      containers:
+      - name: django-app
+        image: your-username/django-messaging-app:v1.1.0
+        # Or use: python:3.11-alpine for testing
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        env:
+        - name: VERSION
+          value: "green-v1.1.0"
+        - name: APP_COLOR
+          value: "green"
+        - name: DJANGO_SETTINGS_MODULE
+          value: "django_app.settings"
+        - name: NEW_FEATURE_FLAG
+          value: "enabled"
+        readinessProbe:
+          httpGet:
+            path: /health/
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+        livenessProbe:
+          httpGet:
+            path: /health/
+            port: 8000
+          initialDelaySeconds: 20
+          periodSeconds: 10
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: django-app-green-service
+  labels:
+    app: django-messaging
+    version: green
+spec:
+  selector:
+    app: django-messaging
+    version: green
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+  type: ClusterIP
