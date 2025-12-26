@@ -1,0 +1,117 @@
+
+pipeline {
+  agent {
+    docker { image 'python:3.10' }
+  }
+
+  // options {
+  //   timestamps()
+  //   ansiColor('xterm')
+  //   buildDiscarder(logRotator(numToKeepStr: '20'))
+  //   timeout(time: 30, unit: 'MINUTES')
+  // }
+
+  parameters {
+    string(name: 'GIT_REPO', defaultValue: 'https://github.com/ebunilo/alx-backend-python.git', description: 'GitHub repository URL')
+    string(name: 'BRANCH', defaultValue: 'main', description: 'Branch to build')
+    string(name: 'GITHUB_CREDENTIALS_ID', defaultValue: 'github-credentials', description: 'Jenkins credentials ID for GitHub access')
+    string(name: 'DOCKER_REPO', defaultValue: 'icalistus/messaging_app', description: 'Docker repository (e.g., user/image)')
+    string(name: 'IMAGE_TAG', defaultValue: '', description: 'Optional image tag. Defaults to BUILD_NUMBER')
+    string(name: 'DOCKERFILE', defaultValue: 'Dockerfile', description: 'Path to Dockerfile relative to repo root')
+    string(name: 'BUILD_CONTEXT', defaultValue: '.', description: 'Docker build context relative to repo root')
+    string(name: 'DOCKER_REGISTRY', defaultValue: '', description: 'Docker registry URL. Leave empty for Docker Hub')
+    string(name: 'DOCKER_CREDENTIALS_ID', defaultValue: 'dockerhub-credentials', description: 'Jenkins credentials ID for Docker registry')
+  }
+
+  environment {
+    DJANGO_SETTINGS_MODULE = 'messaging_app.settings'
+    PIP_DISABLE_PIP_VERSION_CHECK = '1'
+    PYTHONDONTWRITEBYTECODE = '1'
+    REPORT_DIR = 'reports'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        git branch: params.BRANCH, url: params.GIT_REPO, credentialsId: params.GITHUB_CREDENTIALS_ID
+        stash name: 'scm', includes: '**/*', useDefaultExcludes: false
+      }
+    }
+
+    stage('Setup') {
+      steps {
+        sh '''
+          python --version
+          pip --version
+          mkdir -p "${REPORT_DIR}"
+        '''
+      }
+    }
+
+    stage('Install dependencies') {
+      steps {
+        sh '''
+          pip3 install -r ../requirements.txt
+          pip3 install pytest pytest-django pytest-html pytest-cov
+        '''
+      }
+    }
+
+    // stage('Run tests (pytest)') {
+    //   steps {
+    //     sh '''
+    //       pytest \
+    //         --ds=${DJANGO_SETTINGS_MODULE} \
+    //         --junitxml=${REPORT_DIR}/junit.xml \
+    //         --html=${REPORT_DIR}/report.html --self-contained-html \
+    //         --cov=. --cov-report=xml:${REPORT_DIR}/coverage.xml --cov-report=term
+    //     '''
+    //   }
+    // }
+
+    stage('Docker Build') {
+      agent { label 'docker' }
+      steps {
+        unstash 'scm'
+        script {
+          def tag = params.IMAGE_TAG?.trim() ? params.IMAGE_TAG.trim() : env.BUILD_NUMBER
+          sh """
+            docker version
+            docker build -t ${params.DOCKER_REPO}:${tag} -f ${params.DOCKERFILE} ${params.BUILD_CONTEXT}
+            docker tag ${params.DOCKER_REPO}:${tag} ${params.DOCKER_REPO}:latest
+          """
+        }
+      }
+    }
+
+    stage('Docker Push') {
+      agent { label 'docker' }
+      steps {
+        script {
+          def tag = params.IMAGE_TAG?.trim() ? params.IMAGE_TAG.trim() : env.BUILD_NUMBER
+          docker.withRegistry(params.DOCKER_REGISTRY, params.DOCKER_CREDENTIALS_ID) {
+            sh """
+              docker push ${params.DOCKER_REPO}:${tag}
+              docker push ${params.DOCKER_REPO}:latest
+            """
+          }
+        }
+      }
+    }
+  }
+
+  // post {
+  //   always {
+  //     junit allowEmptyResults: true, testResults: "${REPORT_DIR}/junit.xml"
+  //     archiveArtifacts artifacts: "${REPORT_DIR}/**", fingerprint: true, allowEmptyArchive: true
+  //     publishHTML(target: [
+  //       reportDir: "${REPORT_DIR}",
+  //       reportFiles: 'report.html',
+  //       reportName: 'PyTest Report',
+  //       keepAll: true,
+  //       allowMissing: true,
+  //       alwaysLinkToLastBuild: true
+  //     ])
+  //   }
+  // }
+}
